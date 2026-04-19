@@ -1,38 +1,50 @@
+import base64
+import io
+import json
+import logging
+import os
+import sys
+
+import boto3
 from boto3.session import Session
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
-import json
-import os
+from botocore.exceptions import ClientError
 from requests import request
-import base64
-import io
-import sys
 
-#For this to run on a local machine in VScode, you need to set the AWS_PROFILE environment variable to the name of the profile/credentials you want to use. 
+logging.basicConfig(format="%(levelname)s %(asctime)s %(message)s", level=logging.INFO)
+logger = logging.getLogger()
 
-#check for credentials
-#echo $AWS_ACCESS_KEY_ID
-#echo $AWS_SECRET_ACCESS_KEY
-#echo $AWS_SESSION_TOKEN
 
-agentId = "xxx" #INPUT YOUR AGENT ID HERE
-agentAliasId = "xxx" # Hits draft alias, set to a specific alias id for a deployed version
+# For this to run on a local machine in VScode, you need to set the AWS_PROFILE environment variable to the name of the profile/credentials you want to use.
+
+# check for credentials
+# echo $AWS_ACCESS_KEY_ID
+# echo $AWS_SECRET_ACCESS_KEY
+# echo $AWS_SESSION_TOKEN
+
+agentId = "IP6TTVP5AP"  # INPUT YOUR AGENT ID HERE
+agentAliasId = (
+    "IMBBRAE6VG"  # Hits draft alias, set to a specific alias id for a deployed version
+)
 theRegion = "us-west-2"
 
 os.environ["AWS_REGION"] = theRegion
 region = os.environ.get("AWS_REGION")
 llm_response = ""
+bedrock_agent_runtime = boto3.client("bedrock-agent-runtime")
+
 
 def sigv4_request(
     url,
-    method='GET',
+    method="GET",
     body=None,
     params=None,
     headers=None,
-    service='execute-api',
-    region=os.environ['AWS_REGION'],
-    credentials=Session().get_credentials().get_frozen_credentials()
+    service="execute-api",
+    region=os.environ["AWS_REGION"],
+    credentials=Session().get_credentials().get_frozen_credentials(),
 ):
     """Sends an HTTP request signed with SigV4
     Args:
@@ -49,61 +61,111 @@ def sigv4_request(
     """
 
     # sign request
-    req = AWSRequest(
-        method=method,
-        url=url,
-        data=body,
-        params=params,
-        headers=headers
-    )
+    req = AWSRequest(method=method, url=url, data=body, params=params, headers=headers)
     SigV4Auth(credentials, service, region).add_auth(req)
     req = req.prepare()
 
     # send request
-    return request(
-        method=req.method,
-        url=req.url,
-        headers=req.headers,
-        data=req.body
-    )
-    
-    
+    return request(method=req.method, url=req.url, headers=req.headers, data=req.body)
+
 
 def askQuestion(question, url, endSession=False):
-    myobj = {
-        "inputText": question,   
-        "enableTrace": True,
-        "endSession": endSession
-    }
-    
+    myobj = {"inputText": question, "enableTrace": True, "endSession": endSession}
+    print(f"myobj: {myobj}")
+
     # send request
     response = sigv4_request(
         url,
-        method='POST',
-        service='bedrock',
+        method="POST",
+        service="bedrock",
         headers={
-            'content-type': 'application/json', 
-            'accept': 'application/json',
+            "content-type": "application/json",
+            "accept": "application/json",
         },
         region=theRegion,
-        body=json.dumps(myobj)
+        body=json.dumps(myobj),
     )
-    
+    print(f"{response=}")
+    print(dump.dump_all(response).decode("utf-8"))
     return decode_response(response)
 
 
+def askQuestion2(question, sessionId, endSession=False):
+    myobj = {"inputText": question, "enableTrace": True, "endSession": endSession}
+
+    try:
+        response = bedrock_agent_runtime.invoke_agent(
+            agentAliasId=agentAliasId,
+            agentId=agentId,
+            enableTrace=True,
+            sessionId=sessionId,
+            inputText=question,
+        )
+
+        completion = ""
+        trace_data = None
+        step_count = 0
+
+        logger.info(f"Response: {response}")
+        for event in response.get("completion"):
+            logger.info(f"Event: {event}")
+            if "chunk" in event:
+                logger.info("Processing chunk!")
+                chunk = event["chunk"]
+                completion = completion + chunk["bytes"].decode()
+            elif "trace" in event:
+                logger.info("Processing trace!")
+                trace_obj = event["trace"]["trace"]
+                if "orchestrationTrace" in trace_obj:
+                    trace_dump = json.dumps(trace_obj["orchestrationTrace"], indent=2)
+                    if "rationale" in trace_obj["orchestrationTrace"]:
+                        step_count += 1
+                        rationale_text = trace_obj["orchestrationTrace"]["rationale"][
+                            "text"
+                        ]
+                        step_trace = f"\n---------- Step {step_count} ----------\n{rationale_text}"
+                        print(f"step_trace: {step_trace}")
+                        # with trace_col:
+                        #     st.write(step_trace)
+                    elif "modelInvocationInput" not in trace_obj["orchestrationTrace"]:
+                        print(f"trace_dump: {trace_dump}")
+                        # with trace_col:
+                        #     st.write(trace_dump)
+                elif "failureTrace" in trace_obj:
+                    trace_dump = json.dumps(trace_obj["failureTrace"], indent=2)
+                    print(f"trace_dump: {trace_dump}")
+                elif "postProcessingTrace" in trace_obj:
+                    step_count += 1
+                    step_header = f"\n---------- Step {step_count} ----------\n"
+                    print(f"step_header: {step_header}")
+                    print(trace_obj)
+                    # step_trace = f"{json.dumps(trace_obj['postProcessingTrace']['modelInvocationOutput'], indent=2)}"
+                    step_trace = f"{json.dumps(trace_obj['postProcessingTrace']['modelInvocationOutput']['parsedResponse']['text'], indent=2)}"
+                    print(step_trace)
+                    # with trace_col:
+                    #     st.write(step_header)
+                    # with trace_col:
+                    #     st.write(step_trace)
+    except ClientError as e:
+        logger.error(f"Couldn't invoke agent. {e}")
+        raise
+
+    return completion, trace_data
 
 
 def decode_response(response):
     # Create a StringIO object to capture print statements
+    print("Inside decode_response")
     captured_output = io.StringIO()
+    print(f"{captured_output=}")
     sys.stdout = captured_output
 
+    print(f"sys.stdout={sys.stdout}")
     # Your existing logic
     string = ""
     for line in response.iter_content():
         try:
-            string += line.decode(encoding='utf-8')
+            string += line.decode(encoding="utf-8")
         except:
             continue
 
@@ -114,29 +176,29 @@ def decode_response(response):
 
     for idx in range(len(split_response)):
         if "bytes" in split_response[idx]:
-            #print(f"Bytes found index {idx}")
-            encoded_last_response = split_response[idx].split("\"")[3]
+            # print(f"Bytes found index {idx}")
+            encoded_last_response = split_response[idx].split('"')[3]
             decoded = base64.b64decode(encoded_last_response)
-            final_response = decoded.decode('utf-8')
+            final_response = decoded.decode("utf-8")
             print(final_response)
         else:
             print(f"no bytes at index {idx}")
             print(split_response[idx])
-            
+
     last_response = split_response[-1]
     print(f"Lst Response: {last_response}")
     if "bytes" in last_response:
         print("Bytes in last response")
-        encoded_last_response = last_response.split("\"")[3]
+        encoded_last_response = last_response.split('"')[3]
         decoded = base64.b64decode(encoded_last_response)
-        final_response = decoded.decode('utf-8')
+        final_response = decoded.decode("utf-8")
     else:
         print("no bytes in last response")
-        part1 = string[string.find('finalResponse')+len('finalResponse":'):] 
-        part2 = part1[:part1.find('"}')+2]
-        final_response = json.loads(part2)['text']
+        part1 = string[string.find("finalResponse") + len('finalResponse":') :]
+        part2 = part1[: part1.find('"}') + 2]
+        final_response = json.loads(part2)["text"]
 
-    final_response = final_response.replace("\"", "")
+    final_response = final_response.replace('"', "")
     final_response = final_response.replace("{input:{value:", "")
     final_response = final_response.replace(",source:null}}", "")
     llm_response = final_response
@@ -152,34 +214,29 @@ def decode_response(response):
 
 
 def lambda_handler(event, context):
-    
+
     sessionId = event["sessionId"]
     question = event["question"]
     endSession = False
-    
+
     print(f"Session: {sessionId} asked question: {question}")
-    
+
     try:
-        if (event["endSession"] == "true"):
+        if event["endSession"] == "true":
             endSession = True
     except:
         endSession = False
-    
-    url = f'https://bedrock-agent-runtime.{theRegion}.amazonaws.com/agents/{agentId}/agentAliases/{agentAliasId}/sessions/{sessionId}/text'
 
-    
-    try: 
-        response, trace_data = askQuestion(question, url, endSession)
-        
+    url = f"https://bedrock-agent-runtime.{theRegion}.amazonaws.com/agents/{agentId}/agentAliases/{agentAliasId}/sessions/{sessionId}/text"
+
+    try:
+        response, trace_data = askQuestion2(question, sessionId, endSession)
+        print(f"response={response}\n\ntrace_data={trace_data}")
+
         return {
             "status_code": 200,
-            #"body": json.dumps({"response": response, "trace_data": trace_data})
-            "body": json.dumps({"response": response, "trace_data": trace_data})
+            # "body": json.dumps({"response": response, "trace_data": trace_data})
+            "body": json.dumps({"response": response, "trace_data": trace_data}),
         }
     except Exception as e:
-        return {
-            "status_code": 500,
-            "body": json.dumps({"error": str(e)})
-        }
-
-
+        return {"status_code": 500, "body": json.dumps({"error": str(e)})}
